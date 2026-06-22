@@ -157,6 +157,13 @@ const NVIDIA_NIM_UNSUPPORTED_MODELS = new Set([
 	"upstage/solar-10.7b-instruct",
 ]);
 const ZAI_TOOL_STREAM_UNSUPPORTED_MODELS = new Set(["glm-4.5", "glm-4.5-air", "glm-4.5-flash", "glm-4.5v"]);
+const ZAI_GLM52_THINKING_LEVEL_MAP = {
+	minimal: null,
+	low: "high",
+	medium: "high",
+	high: "high",
+	xhigh: "max",
+} as const;
 const EAGER_TOOL_INPUT_STREAMING_UNSUPPORTED_ANTHROPIC_MODELS = new Set([
 	"github-copilot:claude-haiku-4.5",
 	"github-copilot:claude-sonnet-4",
@@ -366,6 +373,12 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		// instead of defaulting to {reasoning:{effort:"none"}} (see openai-completions.ts:575).
 		// Pi's low/medium/high pass through verbatim; OpenRouter normalizes to Mercury's vocabulary.
 		mergeThinkingLevelMap(model, { off: null });
+	}
+	if (model.provider === "openrouter" && model.id === "z-ai/glm-5.2") {
+		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
+	}
+	if (model.provider === "fireworks" && model.id === "accounts/fireworks/models/glm-5p2") {
+		mergeThinkingLevelMap(model, { off: "none", minimal: null, low: "high", medium: "high", xhigh: "max" });
 	}
 	if (model.provider === "opencode-go" && model.id === "kimi-k2.6") {
 		// OpenCode Go exposes Kimi K2.6 thinking as on/off, not distinct effort tiers.
@@ -894,6 +907,8 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					if (m.tool_call !== true) continue;
 					const supportsImage = m.modalities?.input?.includes("image");
 
+					const isGlm52 = modelId === "glm-5.2";
+
 					models.push({
 						id: modelId,
 						name: m.name || modelId,
@@ -901,6 +916,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						provider,
 						baseUrl,
 						reasoning: m.reasoning === true,
+						...(isGlm52 ? { thinkingLevelMap: ZAI_GLM52_THINKING_LEVEL_MAP } : {}),
 						input: supportsImage ? ["text", "image"] : ["text"],
 						cost: {
 							input: m.cost?.input || 0,
@@ -911,6 +927,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						compat: {
 							supportsDeveloperRole: false,
 							thinkingFormat: "zai",
+							...(isGlm52 ? { supportsReasoningEffort: true } : {}),
 							...(!ZAI_TOOL_STREAM_UNSUPPORTED_MODELS.has(modelId) ? { zaiToolStream: true } : {}),
 						},
 						contextWindow: m.limit?.context || 4096,
@@ -937,7 +954,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					cost: {
 						input: m.cost?.input || 0,
 						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
+						cacheRead: m.cost?.cache_read ?? (m.cost?.input ? roundCost(m.cost.input * 0.1) : 0),
 						cacheWrite: m.cost?.cache_write || 0,
 					},
 					contextWindow: m.limit?.context || 4096,
@@ -1500,7 +1517,11 @@ async function generateModels() {
 			candidate.cost.output = 1.9;
 			candidate.cost.cacheRead = 0.119;
 		}
-
+		if (candidate.provider === "fireworks" && candidate.id === "accounts/fireworks/models/glm-5p2") {
+			candidate.api = "openai-completions";
+			candidate.baseUrl = "https://api.fireworks.ai/inference/v1";
+			candidate.compat = { supportsStore: false, supportsDeveloperRole: false };
+		}
 	}
 
 
@@ -1841,9 +1862,10 @@ async function generateModels() {
 
 	for (const candidate of allModels) {
 		if (candidate.api === "openai-completions" && candidate.id.includes("deepseek-v4")) {
+			const preservesNativeReasoningEffort = candidate.provider === "openrouter" || candidate.provider === "opencode";
 			candidate.compat = {
 				...candidate.compat,
-				...(candidate.provider === "openrouter"
+				...(preservesNativeReasoningEffort
 					? {
 							requiresReasoningContentOnAssistantMessages:
 								deepseekCompat.requiresReasoningContentOnAssistantMessages,
@@ -2014,6 +2036,32 @@ async function generateModels() {
 				cacheWrite:0,
 			},
 			contextWindow: 2000000,
+			maxTokens: 30000,
+		});
+	}
+
+	// Add "fusion" alias for openrouter/fusion. OpenRouter exposes Fusion as a
+	// router alias/plugin entry point; its model metadata does not advertise
+	// tools, but the alias resolves to a concrete model that can invoke caller
+	// tools and has the openrouter:fusion server tool auto-injected.
+	if (!allModels.some(m => m.provider === "openrouter" && m.id === "openrouter/fusion")) {
+		allModels.push({
+			id: "openrouter/fusion",
+			name: "OpenRouter: Fusion",
+			api: "openai-completions",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: {
+				// we dont know about the costs because Fusion routes to multiple models
+				// and then charges you for the underlying used models
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 1000000,
 			maxTokens: 30000,
 		});
 	}
